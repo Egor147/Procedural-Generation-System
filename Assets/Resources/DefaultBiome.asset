@@ -1,0 +1,36 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: db626bb9bd9e122499ce997a80c88fed, type: 3}
+  m_Name: DefaultBiome
+  m_EditorClassIdentifier: Assembly-CSharp::BiomeDefinitionSO
+  FloorPrefab: {fileID: 81885031383972286, guid: ca2303f11f5a35e438ff95ac1bec97d7, type: 3}
+  AllowedObjects:
+  - {fileID: 11400000, guid: e37d5af7256877449bf206a7cc4510f5, type: 2}
+  - {fileID: 11400000, guid: 08527a52aa9a1454a8b52d506b86936e, type: 2}
+  ConnectionAnchors:
+  - GridPosition: {x: 5, y: 9}
+    ConnectionDirection: 0
+    CompatibilityTag: 
+  - GridPosition: {x: 5, y: 0}
+    ConnectionDirection: 1
+    CompatibilityTag: 
+  - GridPosition: {x: 9, y: 5}
+    ConnectionDirection: 3
+    CompatibilityTag: 
+  - GridPosition: {x: 0, y: 5}
+    ConnectionDirection: 2
+    CompatibilityTag: 
+  PathWidth: 1
+  MaxPathSlope: 30
+  PlacementDensity: 1
+  pathWanderFactor: 0.5
+  centerAvoidanceStrength: 3

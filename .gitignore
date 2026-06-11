@@ -1,0 +1,31 @@
+# Unity generated folders
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# Auto-generated crash logs and crash report files
+*.crash
+
+# Unity meta files (keep them, but ignore specific temp ones)
+*.pidb.meta
+*.pdb.meta
+*.mdb.meta
+
+# Visual Studio / Rider / VSCode
+.vs/
+.vscode/
+*.sln
+*.csproj
+*.userprefs
+*.suo
+*.user
+*.sublime-workspace
+*.sublime-project
+
+# OS generated
+.DS_Store
+Thumbs.db
