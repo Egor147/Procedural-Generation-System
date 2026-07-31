@@ -1,0 +1,20 @@
+{
+    "name": "Game.Core",
+    "rootNamespace": "",
+    "references": [
+        "GUID:a35efad8797223d499f8c68b1f545dbc"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": true,
+    "precompiledReferences": [
+        "nunit.framework.dll"
+    ],
+    "autoReferenced": false,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

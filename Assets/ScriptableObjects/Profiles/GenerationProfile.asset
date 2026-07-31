@@ -14,6 +14,9 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::GenerationProfileSO
   ActiveChunkRadius: 2
   EnableMultithreading: 1
+  StreamingMode: 0
+  DistanceBasedRadius: 2
+  DistanceBasedUnloadBuffer: 1
   GenerationMode: 0
   GridDimensions: {x: 10, y: 10}
   CellSize: 2

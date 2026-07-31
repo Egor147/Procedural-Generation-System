@@ -15,7 +15,7 @@ public class DemoSceneSetup : MonoBehaviour
     [SerializeField] private Chunk _chunkPrefab;
     [SerializeField] private Transform _spawnPoint;
 
-    private ChunkStreamManager _streamManager;
+    public ChunkStreamManager streamManager;
     private GenerationPipeline _pipeline;
     private ChunkCache _cache;
     private Transform _playerTransform;
@@ -40,7 +40,7 @@ public class DemoSceneSetup : MonoBehaviour
         _pipeline = new GenerationPipeline(_profile, GenerateChunk);
 
         // Setup stream manager
-        _streamManager = new ChunkStreamManager(_profile, _pipeline, _chunkPrefab, _cache);
+        streamManager = new ChunkStreamManager(_profile, _pipeline, _chunkPrefab, _cache);
 
 
         _playerTransform = FindAnyObjectByType<SimplePlayerController>()?.transform;
@@ -62,7 +62,7 @@ public class DemoSceneSetup : MonoBehaviour
             Vector3.zero,
             _profile.RandomSeed != 0 ? _profile.RandomSeed : UnityEngine.Random.Range(int.MinValue, int.MaxValue));
 
-        _streamManager.RequestChunk(initialCoord, request, _spawnPoint.position);
+        streamManager.RequestChunk(initialCoord, request, _spawnPoint.position);
     }
 
     /// <summary>
@@ -77,7 +77,7 @@ public class DemoSceneSetup : MonoBehaviour
             // Only inject if not already assigned in inspector
             if (trigger.GetComponent<TriggerController>().GetStreamManager() == null)
             {
-                trigger.SetStreamManager(_streamManager);
+                trigger.SetStreamManager(streamManager);
             }
         }
     }
@@ -115,7 +115,7 @@ public class DemoSceneSetup : MonoBehaviour
     {
         // Call exactly ONCE per frame with the final player position
         Vector3 targetPos = _playerTransform != null ? _playerTransform.position : _spawnPoint.position;
-        _streamManager.UpdatePlayerPosition(targetPos);
+        streamManager.UpdatePlayerPosition(targetPos);
     }
 
     private void OnValidate()
@@ -126,6 +126,6 @@ public class DemoSceneSetup : MonoBehaviour
 
     private void OnDestroy()
     {
-        _streamManager?.UnloadAll();
+        streamManager?.UnloadAll();
     }
 }

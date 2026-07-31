@@ -6,14 +6,18 @@ using System.Security.Cryptography;
 using System.Text;
 
 /// <summary>
-/// Manages the lifecycle of procedural chunks with STRICT active chunk limit.
-/// Guarantees maximum 2 active chunks: current player chunk + one neighbor via anchor.
+/// Manages the lifecycle of procedural chunks with support for two streaming strategies:
 /// 
-/// Responsibilities:
-/// 1. Spawning new chunks ONLY via biome anchors (Discovery).
-/// 2. Unloading distant chunks to maintain strict memory budget (Lifecycle Management).
-/// 3. Re-loading previously visited chunks from cache when player returns (Regeneration).
-/// 4. Ensuring deterministic Chunk IDs to enable proper caching.
+/// 1. AnchorBased (Optimized): Chunks load only when the player approaches biome-defined
+///    connection anchors. This reduces simultaneous loads and makes caching more effective
+///    since players follow predictable paths through the world.
+/// 
+/// 2. DistanceBased (Standard): Chunks load based on a fixed radius around the player,
+///    similar to Minecraft. Simpler but causes more frequent load/unload cycles and
+///    less effective cache utilization.
+/// 
+/// The streaming mode is configured via GenerationProfileSO.StreamingMode and can be
+/// switched at runtime for comparison studies.
 /// </summary>
 public class ChunkStreamManager
 {
@@ -29,6 +33,7 @@ public class ChunkStreamManager
 
     /// <summary>
     /// Tracks coordinates that are currently being generated asynchronously.
+    /// Prevents duplicate generation requests for the same coordinate.
     /// </summary>
     private readonly HashSet<Vector2Int> _pendingCoords = new HashSet<Vector2Int>();
 
@@ -40,6 +45,8 @@ public class ChunkStreamManager
 
     /// <summary>
     /// Maps Coordinates to their Deterministic Chunk IDs for caching.
+    /// This ensures the same coordinate always produces the same chunk,
+    /// which is essential for cache hits when the player returns.
     /// </summary>
     private readonly Dictionary<Vector2Int, Guid> _coordToChunkId = new Dictionary<Vector2Int, Guid>();
 
@@ -53,26 +60,35 @@ public class ChunkStreamManager
     /// </summary>
     private readonly Dictionary<Vector2Int, float> _requestCooldowns = new Dictionary<Vector2Int, float>();
 
+    // Events for performance monitoring and debugging
+    public event System.Action<Vector2Int> OnChunkLoaded;
+    public event System.Action<Vector2Int> OnChunkUnloaded;
+
     private Vector3 _lastPlayerPosition;
     private readonly float _chunkWidth;
     private readonly float _chunkDepth;
     private readonly float _halfChunkWidth;
     private readonly float _halfChunkDepth;
 
-    // CRITICAL: Strict limits for memory budget compliance
-    private const int MaxActiveChunks = 4; // Hard limit: current + one neighbor
+    // Distance-based streaming parameters
+    private readonly int _distanceBasedRadius;
+    private readonly int _distanceBasedUnloadRadius;
+
+    // Anchor-based streaming parameters
+    private readonly int _maxActiveChunks;
     private readonly float _anchorTriggerDistanceSq;
     private readonly float _unloadDistanceSq;
-    private readonly float _loadDistanceSq; // For regeneration of known chunks
+    private readonly float _loadDistanceSq;
 
     // Stability settings
     private readonly int _minLifetimeFrames = 10;
     private readonly float _requestCooldownSeconds = 1.0f;
     private int _spawnsThisFrame = 0;
-    private const int MaxSpawnsPerFrame = 1; // Only one new chunk per frame
+    private const int MaxSpawnsPerFrame = 1;
 
     /// <summary>
     /// Initializes the stream manager with dependencies and calculates spatial thresholds.
+    /// The initialization logic branches based on the configured StreamingMode.
     /// </summary>
     public ChunkStreamManager(
         GenerationProfileSO config,
@@ -84,31 +100,64 @@ public class ChunkStreamManager
         _pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
         _cache = cache ?? throw new ArgumentNullException(nameof(cache));
 
-        // Pool capacity matches strict active chunk limit
-        _chunkPool = new ChunkPool(chunkPrefab, null, MaxActiveChunks + 2);
-
         _chunkWidth = config.GridDimensions.x * config.CellSize;
         _chunkDepth = config.GridDimensions.y * config.CellSize;
         _halfChunkWidth = _chunkWidth * 0.5f;
         _halfChunkDepth = _chunkDepth * 0.5f;
 
-        // Anchor trigger: player must be very close to anchor to trigger neighbor
-        _anchorTriggerDistanceSq = (_config.CellSize * 5f);
-        _anchorTriggerDistanceSq *= _anchorTriggerDistanceSq;
+        // Initialize parameters based on streaming mode
+        if (config.StreamingMode == StreamingMode.DistanceBased)
+        {
+            // Distance-based: need enough slots for (2*radius+1)^2 chunks in worst case
+            int r = config.DistanceBasedRadius;
+            _maxActiveChunks = (2 * r + 1) * (2 * r + 1) + 2; // +2 for buffer
+            _distanceBasedRadius = config.DistanceBasedRadius;
+            _distanceBasedUnloadRadius = config.DistanceBasedRadius + config.DistanceBasedUnloadBuffer;
 
-        // Unload distance: slightly more than one chunk away from player
-        float unloadDist = Mathf.Max(_chunkWidth, _chunkDepth) * 1.2f;
-        _unloadDistanceSq = unloadDist * unloadDist;
+            // Anchor-based parameters (unused but initialized for safety)
+            _anchorTriggerDistanceSq = 0;
+            _unloadDistanceSq = 0;
+            _loadDistanceSq = 0;
 
-        // Load distance for regeneration: slightly less than unload to create hysteresis
-        float loadDist = Mathf.Max(_chunkWidth, _chunkDepth) * 0.9f;
-        _loadDistanceSq = loadDist * loadDist;
+            Debug.Log($"[ChunkStreamManager] DistanceBased mode: Radius={_distanceBasedRadius}, " +
+                      $"UnloadRadius={_distanceBasedUnloadRadius}, MaxChunks={_maxActiveChunks}");
+        }
+        else
+        {
+            // Anchor-based: strict limit on active chunks
+            _maxActiveChunks = 5;
+            _distanceBasedRadius = 0;
+            _distanceBasedUnloadRadius = 0;
 
-        Debug.Log($"[ChunkStreamManager] Initialized. MaxActive: {MaxActiveChunks}, Load: {loadDist:F1}, Unload: {unloadDist:F1}");
+            // Anchor trigger: player must be very close to anchor to trigger neighbor
+            _anchorTriggerDistanceSq = (_config.CellSize * 5f);
+            _anchorTriggerDistanceSq *= _anchorTriggerDistanceSq;
+
+            // Unload distance: slightly more than one chunk away from player
+            float unloadDist = Mathf.Max(_chunkWidth, _chunkDepth) * 1.2f;
+            _unloadDistanceSq = unloadDist * unloadDist;
+
+            // Load distance for regeneration: slightly less than unload to create hysteresis
+            float loadDist = Mathf.Max(_chunkWidth, _chunkDepth) * 0.9f;
+            _loadDistanceSq = loadDist * loadDist;
+
+            Debug.Log($"[ChunkStreamManager] AnchorBased mode: MaxActive={_maxActiveChunks}, " +
+                      $"Load={loadDist:F1}, Unload={unloadDist:F1}");
+        }
+
+        // Pool capacity matches the maximum active chunks for this mode
+        _chunkPool = new ChunkPool(chunkPrefab, null, _maxActiveChunks + 2);
     }
 
     /// <summary>
+    /// Public accessor for the number of currently active chunks.
+    /// Used by PerformanceMonitor for telemetry.
+    /// </summary>
+    public int ActiveChunkCount => _activeChunks.Count;
+
+    /// <summary>
     /// Main tick method. Must be called EXACTLY ONCE per frame from MonoBehaviour.Update().
+    /// Dispatches to the appropriate streaming strategy based on the configured mode.
     /// </summary>
     public void UpdatePlayerPosition(Vector3 playerPosition)
     {
@@ -118,23 +167,158 @@ public class ChunkStreamManager
         // 1. Clean up expired cooldowns
         CleanupCooldowns();
 
-        // 2. Enforce strict active chunk limit BEFORE loading new ones
-        EnforceActiveChunkLimit();
+        // 2. Strategy dispatch: different logic per streaming mode
+        if (_config.StreamingMode == StreamingMode.DistanceBased)
+        {
+            // Distance-based: load/unload based purely on player distance
+            EvaluateUnloadingDistanceBased();
+            EvaluateLoadingDistanceBased(playerPosition);
+        }
+        else
+        {
+            // Anchor-based: load via anchors, unload based on distance
+            EnforceActiveChunkLimit();
+            EvaluateUnloading();
+            EvaluateLoading(playerPosition);
+        }
+    }
 
-        // 3. Unload distant chunks
-        EvaluateUnloading();
+    // ========================================================================
+    // DISTANCE-BASED STREAMING (Standard/Naive approach)
+    // ========================================================================
 
-        // 4. Load new chunks via anchors OR regenerate known chunks
-        EvaluateLoading(playerPosition);
+    /// <summary>
+    /// Computes the chunk coordinate that contains the given world position.
+    /// Uses floor division so that negative coordinates work correctly
+    /// (player at x=-0.1 should be in chunk -1, not chunk 0).
+    /// </summary>
+    private Vector2Int WorldToChunkCoord(Vector3 worldPos)
+    {
+        return new Vector2Int(
+            Mathf.FloorToInt(worldPos.x / _chunkWidth),
+            Mathf.FloorToInt(worldPos.z / _chunkDepth));
     }
 
     /// <summary>
-    /// CRITICAL: Enforces hard limit on active chunks.
+    /// Unloads chunks that are outside the (Radius + Buffer) range from the player.
+    /// The buffer creates hysteresis so chunks don't flicker on/off at the boundary.
+    /// For example, with Radius=2 and Buffer=1, chunks load at distance 2 but
+    /// only unload at distance 3, preventing constant load/unload cycles.
+    /// </summary>
+    private void EvaluateUnloadingDistanceBased()
+    {
+        Vector2Int playerChunk = WorldToChunkCoord(_lastPlayerPosition);
+        var toUnload = new List<Vector2Int>();
+
+        foreach (var kvp in _activeChunks)
+        {
+            var coord = kvp.Key;
+
+            // Manhattan distance in chunk coordinates
+            int dist = Mathf.Abs(coord.x - playerChunk.x) + Mathf.Abs(coord.y - playerChunk.y);
+
+            if (dist > _distanceBasedUnloadRadius)
+            {
+                toUnload.Add(coord);
+            }
+        }
+
+        foreach (var coord in toUnload)
+        {
+            UnloadChunk(coord);
+        }
+    }
+
+    /// <summary>
+    /// Loads all chunks within the configured radius around the player's chunk.
+    /// Uses a spiral pattern (closest first) so the player sees nearby chunks
+    /// populate before distant ones. This creates a better user experience
+    /// than random order loading.
+    /// </summary>
+    private void EvaluateLoadingDistanceBased(Vector3 playerPos)
+    {
+        Vector2Int playerChunk = WorldToChunkCoord(playerPos);
+
+        // Generate coordinates in spiral order (Manhattan distance rings)
+        // This ensures we load the closest chunks first when under spawn budget
+        var coordsInRadius = new List<Vector2Int>();
+        for (int ring = 0; ring <= _distanceBasedRadius; ring++)
+        {
+            if (ring == 0)
+            {
+                coordsInRadius.Add(playerChunk);
+            }
+            else
+            {
+                // Walk the perimeter of the Manhattan-distance ring
+                for (int dx = -ring; dx <= ring; dx++)
+                {
+                    int dz1 = ring - Mathf.Abs(dx);
+                    int dz2 = -dz1;
+                    coordsInRadius.Add(playerChunk + new Vector2Int(dx, dz1));
+                    if (dz1 != dz2)
+                    {
+                        coordsInRadius.Add(playerChunk + new Vector2Int(dx, dz2));
+                    }
+                }
+            }
+        }
+
+        // Try to load each coordinate, respecting per-frame spawn budget
+        foreach (var coord in coordsInRadius)
+        {
+            if (_spawnsThisFrame >= MaxSpawnsPerFrame) break;
+            if (_activeChunks.Count >= _maxActiveChunks) break;
+
+            if (_activeChunks.ContainsKey(coord)) continue;
+            if (_pendingCoords.Contains(coord)) continue;
+            if (_requestCooldowns.ContainsKey(coord)) continue;
+
+            // Try cache first, otherwise generate fresh
+            Guid chunkId = GenerateChunkId(coord);
+            Vector3 worldOrigin = CoordToWorldOrigin(coord);
+
+            if (_config.EnableChunkCache && _cache.TryGetSnapshot(chunkId, out var snapshot))
+            {
+                var request = new GenerationRequest(
+                    chunkId,
+                    snapshot.BaseLayout.BiomeDefinition,
+                    worldOrigin,
+                    _config.RandomSeed != 0 ? _config.RandomSeed : UnityEngine.Random.Range(int.MinValue, int.MaxValue));
+
+                RequestChunk(coord, request, playerPos);
+                _spawnsThisFrame++;
+            }
+            else
+            {
+                // Cache miss - generate from scratch. This is the expensive path
+                // that the optimized approach avoids on subsequent visits.
+                var biome = GetBiomeForCoordinate(coord);
+                if (biome != null)
+                {
+                    int seed = _config.RandomSeed != 0 ? _config.RandomSeed : UnityEngine.Random.Range(int.MinValue, int.MaxValue);
+                    var request = new GenerationRequest(chunkId, biome, worldOrigin, seed);
+                    RequestChunk(coord, request, playerPos);
+                    _spawnsThisFrame++;
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // ANCHOR-BASED STREAMING (Optimized approach)
+    // ========================================================================
+
+    /// <summary>
+    /// Enforces hard limit on active chunks for anchor-based mode.
     /// If limit exceeded, unloads farthest chunks until within budget.
+    /// This is a safety net - in theory, anchor-based loading should
+    /// never exceed the limit, but this prevents bugs from causing
+    /// unbounded memory growth.
     /// </summary>
     private void EnforceActiveChunkLimit()
     {
-        while (_activeChunks.Count > MaxActiveChunks)
+        while (_activeChunks.Count > _maxActiveChunks)
         {
             // Find and unload the farthest chunk from player
             Vector2Int? farthestCoord = null;
@@ -162,103 +346,9 @@ public class ChunkStreamManager
     }
 
     /// <summary>
-    /// Unloads a specific chunk and cleans up tracking data.
-    /// </summary>
-    private void UnloadChunk(Vector2Int coord)
-    {
-        if (_activeChunks.Remove(coord, out var chunk))
-        {
-            if (_config.EnableChunkCache && _coordToChunkId.TryGetValue(coord, out var chunkId))
-                _cache.UpdateDelta(chunkId, chunk.CaptureDelta());
-
-            _chunkPool.Return(chunk);
-            _chunkStates.Remove(coord);
-        }
-    }
-
-    private void CleanupCooldowns()
-    {
-        var expired = new List<Vector2Int>();
-        float now = Time.time;
-        foreach (var kvp in _requestCooldowns)
-        {
-            if (now > kvp.Value) expired.Add(kvp.Key);
-        }
-        foreach (var coord in expired) _requestCooldowns.Remove(coord);
-    }
-
-    /// <summary>
-    /// Public API: Requests a chunk from the pipeline or cache.
-    /// Respects MaxActiveChunks limit - may trigger immediate unload of distant chunk.
-    /// </summary>
-    public void RequestChunk(Vector2Int coord, GenerationRequest request, Vector3 playerPosition)
-    {
-        // Safety checks
-        if (_activeChunks.ContainsKey(coord)) return;
-        if (_pendingCoords.Contains(coord)) return;
-
-        // Check cooldown to prevent infinite loops on persistent failures
-        if (_requestCooldowns.TryGetValue(coord, out var cooldown) && Time.time < cooldown) return;
-
-        _pendingCoords.Add(coord);
-        _generatedCoords.Add(coord);
-        _coordToChunkId[coord] = request.ChunkId;
-        _chunkStates[coord] = new ChunkRuntimeState { SpawnFrame = Time.frameCount };
-
-        // Try cache first (synchronous)
-        if (_config.EnableChunkCache && _cache.TryGetSnapshot(request.ChunkId, out var snapshot))
-        {
-            _pendingCoords.Remove(coord);
-            if (InstantiateFromSnapshot(snapshot, request.WorldOrigin, coord, request.ChunkId))
-            {
-                _requestCooldowns.Remove(coord);
-                EnforceActiveChunkLimit(); // Ensure limit after instantiation
-            }
-            else
-            {
-                SetCooldown(coord);
-            }
-            return;
-        }
-
-        // Async generation
-        _pipeline.ScheduleGeneration(request, result =>
-        {
-            _pendingCoords.Remove(coord);
-
-            if (result.ChunkId != Guid.Empty)
-            {
-                if (_config.EnableChunkCache)
-                    _cache.StoreSnapshot(result.ChunkId, result, new ChunkDelta());
-
-                if (InstantiateFromLayout(result, request.WorldOrigin, coord, result.ChunkId))
-                {
-                    _requestCooldowns.Remove(coord);
-                    EnforceActiveChunkLimit(); // Ensure limit after instantiation
-                }
-                else
-                {
-                    SetCooldown(coord);
-                }
-            }
-            else
-            {
-                _generatedCoords.Remove(coord);
-                _coordToChunkId.Remove(coord);
-                _chunkStates.Remove(coord);
-                SetCooldown(coord);
-                Debug.LogError($"[ChunkStreamManager] Pipeline returned empty result for {coord}");
-            }
-        });
-    }
-
-    private void SetCooldown(Vector2Int coord)
-    {
-        _requestCooldowns[coord] = Time.time + _requestCooldownSeconds;
-    }
-
-    /// <summary>
     /// Unloads chunks that exceed the unload distance threshold.
+    /// Uses hysteresis (load distance < unload distance) to prevent
+    /// chunks from flickering on/off when the player is near the boundary.
     /// </summary>
     private void EvaluateUnloading()
     {
@@ -287,18 +377,21 @@ public class ChunkStreamManager
     /// <summary>
     /// Evaluates player position to trigger chunk loading.
     /// Prioritizes anchor-based discovery, then regeneration of known chunks.
+    /// This two-phase approach ensures that new chunks are discovered through
+    /// biome anchors first, and only then do we try to restore old chunks
+    /// from cache when the player backtracks.
     /// </summary>
     private void EvaluateLoading(Vector3 playerPos)
     {
         // 1. Try to discover NEW neighbors via anchors (higher priority)
-        if (_spawnsThisFrame < MaxSpawnsPerFrame && _activeChunks.Count < MaxActiveChunks)
+        if (_spawnsThisFrame < MaxSpawnsPerFrame && _activeChunks.Count < _maxActiveChunks)
         {
             TryDiscoverNeighborsFromAllChunks(playerPos);
         }
 
         // 2. Try to regenerate KNOWN chunks from cache (lower priority)
         // Only if we still have budget and haven't spawned this frame
-        if (_spawnsThisFrame < MaxSpawnsPerFrame && _activeChunks.Count < MaxActiveChunks)
+        if (_spawnsThisFrame < MaxSpawnsPerFrame && _activeChunks.Count < _maxActiveChunks)
         {
             TryRegenerateKnownChunks(playerPos);
         }
@@ -307,6 +400,10 @@ public class ChunkStreamManager
     /// <summary>
     /// Scans anchors on active chunks to discover NEW neighbors.
     /// Only triggers if under MaxActiveChunks limit.
+    /// This is the core of the anchor-based approach: chunks only load
+    /// when the player approaches a specific connection point, which
+    /// dramatically reduces the number of simultaneous loads compared
+    /// to distance-based loading.
     /// </summary>
     private void TryDiscoverNeighborsFromAllChunks(Vector3 playerPos)
     {
@@ -316,7 +413,7 @@ public class ChunkStreamManager
         foreach (var chunk in activeChunksSnapshot)
         {
             if (_spawnsThisFrame >= MaxSpawnsPerFrame) break;
-            if (_activeChunks.Count >= MaxActiveChunks) break; // Hard limit check
+            if (_activeChunks.Count >= _maxActiveChunks) break;
 
             var biomeDef = chunk.layoutData.BiomeDefinition;
             if (biomeDef?.ConnectionAnchors == null) continue;
@@ -324,7 +421,7 @@ public class ChunkStreamManager
             foreach (var anchor in biomeDef.ConnectionAnchors)
             {
                 if (_spawnsThisFrame >= MaxSpawnsPerFrame) break;
-                if (_activeChunks.Count >= MaxActiveChunks) break;
+                if (_activeChunks.Count >= _maxActiveChunks) break;
 
                 // Calculate anchor position in world space
                 Vector3 anchorLocalPos = new Vector3(
@@ -368,6 +465,8 @@ public class ChunkStreamManager
     /// <summary>
     /// Restores KNOWN chunks from cache when player returns to their area.
     /// Only triggers if under MaxActiveChunks limit and chunk is within load distance.
+    /// This handles backtracking: when the player goes back to a previously
+    /// visited area, we restore from cache instead of regenerating from scratch.
     /// </summary>
     private void TryRegenerateKnownChunks(Vector3 playerPos)
     {
@@ -375,7 +474,7 @@ public class ChunkStreamManager
         foreach (var coord in _generatedCoords)
         {
             if (_spawnsThisFrame >= MaxSpawnsPerFrame) break;
-            if (_activeChunks.Count >= MaxActiveChunks) break;
+            if (_activeChunks.Count >= _maxActiveChunks) break;
 
             // Skip if already active or currently generating
             if (_activeChunks.ContainsKey(coord)) continue;
@@ -403,12 +502,170 @@ public class ChunkStreamManager
                     RequestChunk(coord, request, playerPos);
                     _spawnsThisFrame++;
                 }
+                else
+                {
+                    // FALLBACK: Snapshot not found in cache - regenerate via pipeline
+                    // This can happen if LRU eviction removed the snapshot, or if
+                    // the chunk was unloaded before async generation completed.
+                    Debug.LogWarning($"[ChunkStreamManager] Cache miss for {coord}, regenerating via pipeline");
+
+                    if (_coordToChunkId.TryGetValue(coord, out var storedChunkId))
+                    {
+                        var biome = GetBiomeForCoordinate(coord);
+                        if (biome != null)
+                        {
+                            Vector3 worldOrigin = CoordToWorldOrigin(coord);
+                            int seed = _config.RandomSeed != 0 ? _config.RandomSeed : UnityEngine.Random.Range(int.MinValue, int.MaxValue);
+
+                            var request = new GenerationRequest(
+                                storedChunkId,
+                                biome,
+                                worldOrigin,
+                                seed);
+
+                            RequestChunk(coord, request, playerPos);
+                            _spawnsThisFrame++;
+                        }
+                    }
+                }
             }
         }
     }
 
+    // ========================================================================
+    // COMMON METHODS (used by both streaming modes)
+    // ========================================================================
+
+    /// <summary>
+    /// Public API: Requests a chunk from the pipeline or cache.
+    /// Respects MaxActiveChunks limit - may trigger immediate unload of distant chunk.
+    /// This is the entry point for all chunk loading, regardless of strategy.
+    /// </summary>
+    public void RequestChunk(Vector2Int coord, GenerationRequest request, Vector3 playerPosition)
+    {
+        // Safety checks
+        if (_activeChunks.ContainsKey(coord)) return;
+        if (_pendingCoords.Contains(coord)) return;
+
+        // Check cooldown to prevent infinite loops on persistent failures
+        if (_requestCooldowns.TryGetValue(coord, out var cooldown) && Time.time < cooldown) return;
+
+        _pendingCoords.Add(coord);
+        _generatedCoords.Add(coord);
+        _coordToChunkId[coord] = request.ChunkId;
+        _chunkStates[coord] = new ChunkRuntimeState { SpawnFrame = Time.frameCount };
+
+        // Try cache first (synchronous)
+        if (_config.EnableChunkCache && _cache.TryGetSnapshot(request.ChunkId, out var snapshot))
+        {
+            _pendingCoords.Remove(coord);
+            if (InstantiateFromSnapshot(snapshot, request.WorldOrigin, coord, request.ChunkId))
+            {
+                _requestCooldowns.Remove(coord);
+                if (_config.StreamingMode == StreamingMode.AnchorBased)
+                {
+                    EnforceActiveChunkLimit();
+                }
+            }
+            else
+            {
+                SetCooldown(coord);
+            }
+            return;
+        }
+
+        // Async generation
+        _pipeline.ScheduleGeneration(request, result =>
+        {
+            _pendingCoords.Remove(coord);
+
+            if (result.ChunkId != Guid.Empty)
+            {
+                if (InstantiateFromLayout(result, request.WorldOrigin, coord, result.ChunkId))
+                {
+                    // Save snapshot AFTER successful instantiation to ensure consistency
+                    if (_config.EnableChunkCache)
+                    {
+                        _cache.StoreSnapshot(result.ChunkId, result, new ChunkDelta());
+                    }
+
+                    _requestCooldowns.Remove(coord);
+                    if (_config.StreamingMode == StreamingMode.AnchorBased)
+                    {
+                        EnforceActiveChunkLimit();
+                    }
+                }
+                else
+                {
+                    SetCooldown(coord);
+                }
+            }
+            else
+            {
+                _generatedCoords.Remove(coord);
+                _coordToChunkId.Remove(coord);
+                _chunkStates.Remove(coord);
+                SetCooldown(coord);
+                Debug.LogError($"[ChunkStreamManager] Pipeline returned empty result for {coord}");
+            }
+        });
+    }
+
+    private void SetCooldown(Vector2Int coord)
+    {
+        _requestCooldowns[coord] = Time.time + _requestCooldownSeconds;
+    }
+
+    /// <summary>
+    /// Unloads a specific chunk and cleans up tracking data.
+    /// Always saves the full snapshot (not just delta) to ensure the chunk
+    /// can be restored when the player returns. This is critical for cache
+    /// correctness - if we only update delta and the snapshot was evicted
+    /// by LRU, we lose the chunk data entirely.
+    /// </summary>
+    private void UnloadChunk(Vector2Int coord)
+    {
+        if (_activeChunks.Remove(coord, out var chunk))
+        {
+            if (_config.EnableChunkCache && _coordToChunkId.TryGetValue(coord, out var chunkId))
+            {
+                var delta = chunk.CaptureDelta();
+
+                // CRITICAL: Always store the full snapshot, not just update delta.
+                // The snapshot might not exist in cache if:
+                // 1. It was evicted by LRU before the chunk was unloaded
+                // 2. The chunk was unloaded before async generation completed
+                // 3. This is the first time the chunk is being unloaded
+                // 
+                // By always calling StoreSnapshot (which handles both create and update),
+                // we ensure the chunk can be restored when the player returns.
+                _cache.StoreSnapshot(chunkId, chunk.layoutData, delta);
+            }
+
+            // Notify subscribers before returning to pool
+            OnChunkUnloaded?.Invoke(coord);
+
+            _chunkPool.Return(chunk);
+            _chunkStates.Remove(coord);
+        }
+    }
+
+    private void CleanupCooldowns()
+    {
+        var expired = new List<Vector2Int>();
+        float now = Time.time;
+        foreach (var kvp in _requestCooldowns)
+        {
+            if (now > kvp.Value) expired.Add(kvp.Key);
+        }
+        foreach (var coord in expired) _requestCooldowns.Remove(coord);
+    }
+
     /// <summary>
     /// Generates a valid, deterministic GUID based on grid coordinates using MD5.
+    /// This ensures the same coordinate always produces the same chunk ID,
+    /// which is essential for cache hits. Without determinism, the cache
+    /// would never find a match even if it has the chunk data.
     /// </summary>
     private Guid GenerateChunkId(Vector2Int coord)
     {
@@ -449,6 +706,8 @@ public class ChunkStreamManager
 
     /// <summary>
     /// Instantiates chunk from cache. Returns true on success, false on failure.
+    /// Applies the delta state AFTER initialization so that Init can skip
+    /// already-collected loot and destroyed obstacles during instantiation.
     /// </summary>
     private bool InstantiateFromSnapshot(ChunkSnapshot snapshot, Vector3 worldOrigin, Vector2Int coord, Guid chunkId)
     {
@@ -463,9 +722,14 @@ public class ChunkStreamManager
 
         try
         {
-            chunk.Init(snapshot.BaseLayout, _config, coord);
+            // Apply delta BEFORE Init so that Init can skip collected loot
             chunk.ApplyDelta(snapshot.RuntimeState);
+            chunk.Init(snapshot.BaseLayout, _config, coord);
             _activeChunks[coord] = chunk;
+
+            // Notify subscribers that a chunk has been loaded
+            OnChunkLoaded?.Invoke(coord);
+
             return true;
         }
         catch (Exception ex)
@@ -478,6 +742,7 @@ public class ChunkStreamManager
 
     /// <summary>
     /// Instantiates chunk from pipeline. Returns true on success, false on failure.
+    /// The snapshot is saved by the caller (RequestChunk) after successful instantiation.
     /// </summary>
     private bool InstantiateFromLayout(LayoutData layout, Vector3 worldOrigin, Vector2Int coord, Guid chunkId)
     {
@@ -494,6 +759,10 @@ public class ChunkStreamManager
         {
             chunk.Init(layout, _config, coord);
             _activeChunks[coord] = chunk;
+
+            // Notify subscribers that a chunk has been loaded
+            OnChunkLoaded?.Invoke(coord);
+
             return true;
         }
         catch (Exception ex)
@@ -503,16 +772,6 @@ public class ChunkStreamManager
             return false;
         }
     }
-
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private Vector2Int GetExitCellForNext(Direction exitDir) => exitDir switch
-    {
-        Direction.Forward => new Vector2Int(_config.GridDimensions.x - 1, _config.GridDimensions.y - 1),
-        Direction.Back => new Vector2Int(0, _config.GridDimensions.y - 1),
-        Direction.Right => new Vector2Int(_config.GridDimensions.x - 1, _config.GridDimensions.y - 1),
-        Direction.Left => new Vector2Int(0, _config.GridDimensions.y - 1),
-        _ => Vector2Int.zero
-    };
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private Vector2Int GetDirectionOffset(Direction dir) => dir switch
@@ -526,6 +785,7 @@ public class ChunkStreamManager
 
     /// <summary>
     /// Unloads all active chunks and clears all tracking data.
+    /// Use when quitting the game or loading a completely different world.
     /// </summary>
     public void UnloadAll()
     {

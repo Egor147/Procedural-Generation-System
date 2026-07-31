@@ -12,6 +12,7 @@ GameObject:
   - component: {fileID: 2197046652515430411}
   - component: {fileID: 4032179706144372775}
   - component: {fileID: 4223449214834966303}
+  - component: {fileID: 6009731221810087489}
   m_Layer: 0
   m_Name: Loot
   m_TagString: Loot
@@ -67,7 +68,7 @@ MeshRenderer:
   m_RenderingLayerMask: 1
   m_RendererPriority: 0
   m_Materials:
-  - {fileID: 2100000, guid: 31321ba15b8f8eb4c954353edc038b1d, type: 2}
+  - {fileID: 2100000, guid: 754f201aff6305144b1c23641cd0a23b, type: 2}
   m_StaticBatchInfo:
     firstSubMesh: 0
     subMeshCount: 0
@@ -112,3 +113,16 @@ SphereCollider:
   serializedVersion: 3
   m_Radius: 0.5
   m_Center: {x: 0, y: 0, z: 0}
+--- !u!114 &6009731221810087489
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 4954872735629856942}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: e06a2e311d7b4c345922ae9a07e7d326, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: Game.Core::LootItem
+  _lootId: 

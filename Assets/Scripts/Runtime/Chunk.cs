@@ -21,6 +21,38 @@ public class Chunk : MonoBehaviour
     /// </summary>
     public Vector2Int GridCoordinate { get; private set; }
 
+    // Runtime delta for this chunk instance. Holds the set of collected loot
+    // IDs (and later, destroyed obstacles, activated triggers, etc.).
+    // Starts as null and is populated either by ApplyDelta (when restoring
+    // from cache) or by MarkLootCollected (when the player picks something up).
+    private ChunkDelta _runtimeDelta;
+
+    /// <summary>
+    /// Records that a piece of loot has been picked up. Called by LootItem
+    /// when the player walks through it. The ID is added to the runtime delta,
+    /// which is what CaptureDelta() later returns for cache storage.
+    /// </summary>
+    public void MarkLootCollected(string lootId)
+    {
+        if (_runtimeDelta == null)
+        {
+            _runtimeDelta = new ChunkDelta();
+        }
+
+        _runtimeDelta.CollectedLootIds.Add(lootId);
+    }
+
+    // Builds a deterministic ID for a piece of loot based on its cell
+    // coordinates and the chunk seed. Two regenerations of the same chunk
+    // (same seed, same grid position) will produce the same ID, which is
+    // the whole reason this system works: the "collected" set in the delta
+    // can be matched against freshly spawned loot.
+    private static string GenerateLootId(Vector3Int cellCoord, int chunkSeed)
+    {
+        return $"loot_{chunkSeed}_{cellCoord.x}_{cellCoord.y}_{cellCoord.z}";
+    }
+
+
     /// <summary>
     /// Initializes the chunk with generated layout data and its global grid coordinate.
     /// </summary>
@@ -56,22 +88,54 @@ public class Chunk : MonoBehaviour
             for (int z = 0; z < layoutData.Grid.GetLength(1); z++)
             {
                 var placedCell = layoutData.Grid[x, z];
-                if (placedCell.PlacedObject?.Prefab != null)
+                if (placedCell.PlacedObject?.Prefab == null) continue;
+
+                // Check whether this object is loot. We detect it by the presence
+                // of a LootItem component on the prefab rather than by tags or
+                // naming conventions, so the placer doesn't need to know anything
+                // special about loot - it just places whatever the biome says.
+                var lootPrefabComponent = placedCell.PlacedObject.Prefab.GetComponent<LootItem>();
+                bool isLoot = lootPrefabComponent != null;
+
+                if (isLoot)
                 {
-                    // Calculate world offset relative to chunk's bottom-left corner (WorldOrigin)
-                    Vector3 localOffset = new Vector3(
-                        (x + 0.5f) * config.CellSize,
-                        (0.75f) * config.CellSize, // Slightly above floor to prevent z-fighting
-                        (z + 0.5f) * config.CellSize);
+                    string lootId = GenerateLootId(new Vector3Int(x, 0, z), layoutData.Metadata.Seed);
 
-                    var obj = Instantiate(placedCell.PlacedObject.Prefab, _contentRoot);
-
-                    // Position object: chunk center -> corner -> cell offset
-                    obj.transform.position = transform.position - chunkSize * 0.5f + localOffset;
-                    obj.transform.rotation = placedCell.LocalRotation;
-
-                    _instantiatedObjects.Add(obj);
+                    // If this loot was already collected in a previous visit to this
+                    // chunk, skip instantiation entirely. The delta carries that
+                    // information forward across chunk reloads.
+                    if (_runtimeDelta != null && _runtimeDelta.CollectedLootIds.Contains(lootId))
+                    {
+                        continue;
+                    }
                 }
+
+                // Calculate world offset relative to chunk's bottom-left corner (WorldOrigin)
+                Vector3 localOffset = new Vector3(
+                    (x + 0.5f) * config.CellSize,
+                    (0.75f) * config.CellSize,
+                    (z + 0.5f) * config.CellSize);
+
+                var obj = Instantiate(placedCell.PlacedObject.Prefab, _contentRoot);
+
+                // Position object: chunk center -> corner -> cell offset
+                obj.transform.position = transform.position - chunkSize * 0.5f + localOffset;
+                obj.transform.rotation = placedCell.LocalRotation;
+
+                // For loot objects, wire up the LootItem component with its ID and
+                // parent chunk reference. Without this step the loot would exist in
+                // the scene but would be uncollectable and wouldn't persist its state.
+                if (isLoot)
+                {
+                    string lootId = GenerateLootId(new Vector3Int(x, 0, z), layoutData.Metadata.Seed);
+                    var lootComponent = obj.GetComponent<LootItem>();
+                    if (lootComponent != null)
+                    {
+                        lootComponent.Initialize(lootId, this);
+                    }
+                }
+
+                _instantiatedObjects.Add(obj);
             }
         }
 
@@ -84,18 +148,22 @@ public class Chunk : MonoBehaviour
     }
 
     /// <summary>
-    /// Applies runtime delta state (collected loot, destroyed obstacles) to the chunk.
+    /// Applies a previously captured delta to this chunk instance.
+    /// Called by ChunkStreamManager when restoring a chunk from cache.
+    /// The key effect is that _runtimeDelta now contains the set of
+    /// collected loot IDs, so Init() (or any later logic) can skip them.
     /// </summary>
     public void ApplyDelta(ChunkDelta delta)
     {
-        _appliedDelta = delta;
-        Debug.Log($"[Chunk] Applied delta: {delta.CollectedLootIds.Count} items.");
+        _runtimeDelta = delta ?? new ChunkDelta();
     }
 
     /// <summary>
-    /// Captures current runtime state for caching before chunk recycling.
+    /// Returns the current runtime delta for this chunk. Called by
+    /// ChunkStreamManager right before a chunk is returned to the pool,
+    /// so the collected-loot state can be saved into the cache snapshot.
     /// </summary>
-    public ChunkDelta CaptureDelta() => _appliedDelta ?? new ChunkDelta();
+    public ChunkDelta CaptureDelta() => _runtimeDelta ?? new ChunkDelta();
 
     /// <summary>
     /// Deactivates the chunk for pooling without destroying GameObjects.
@@ -121,6 +189,7 @@ public class Chunk : MonoBehaviour
 
         _instantiatedObjects.Clear();
         layoutData = default;
+        _runtimeDelta = null;
         _appliedDelta = null;
         GridCoordinate = default;
     }

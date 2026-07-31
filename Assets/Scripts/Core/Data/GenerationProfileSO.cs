@@ -1,4 +1,29 @@
 using UnityEngine;
+using System;
+
+/// <summary>
+/// Determines how chunks are discovered and loaded around the player.
+/// </summary>
+public enum StreamingMode
+{
+    /// <summary>
+    /// Loads chunks only through biome-defined connection anchors.
+    /// This is the optimized approach: chunks load when the player
+    /// approaches specific connection points, which reduces the number
+    /// of simultaneous loads and makes caching more effective since
+    /// players tend to follow the same paths.
+    /// </summary>
+    AnchorBased,
+
+    /// <summary>
+    /// Loads all chunks within a fixed radius around the player.
+    /// This is the standard/naive approach (like Minecraft): chunks
+    /// load based purely on distance, regardless of path connectivity.
+    /// Simpler to implement but causes more frequent load/unload cycles
+    /// and less effective cache utilization.
+    /// </summary>
+    DistanceBased
+}
 
 /// <summary>
 /// Global configuration profile for procedural chunk generation.
@@ -22,6 +47,31 @@ public class GenerationProfileSO : ScriptableObject
     /// </summary>
     [Tooltip("If unchecked, generation runs on main thread (for debugging or baseline benchmarks).")]
     public bool EnableMultithreading = true;
+
+    /// <summary>
+    /// Streaming strategy. AnchorBased loads chunks only through biome anchors
+    /// (optimized, cache-friendly). DistanceBased loads all chunks within a
+    /// fixed radius around the player (standard approach, like Minecraft).
+    /// </summary>
+    [Tooltip("AnchorBased = optimized (cache-friendly). DistanceBased = standard (radius-based).")]
+    public StreamingMode StreamingMode = StreamingMode.AnchorBased;
+
+    /// <summary>
+    /// Radius in chunks for DistanceBased streaming mode.
+    /// Ignored in AnchorBased mode.
+    /// </summary>
+    [Tooltip("How many chunks away from the player should be kept active (DistanceBased only).")]
+    [Range(1, 10)]
+    public int DistanceBasedRadius = 2;
+
+    /// <summary>
+    /// Extra buffer for unloading in DistanceBased mode.
+    /// Chunks are unloaded only when they are (Radius + UnloadBuffer) away,
+    /// creating hysteresis that prevents constant load/unload at boundaries.
+    /// </summary>
+    [Tooltip("Extra chunks before unloading in DistanceBased mode (hysteresis buffer).")]
+    [Range(0, 5)]
+    public int DistanceBasedUnloadBuffer = 1;
 
     /// <summary>
     /// Allowed generation directions. Horizontal only, vertical only, or omnidirectional.
